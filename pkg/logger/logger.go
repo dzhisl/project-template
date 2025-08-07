@@ -15,7 +15,7 @@ const skipLevel = 1
 // InitLogger sets up the global logger based on the environment
 func InitLogger() {
 	var cfg zap.Config
-	environment := config.AppConfig.StageLevel
+	environment := config.GetConfig().StageLevel
 
 	// Use JSON logger for production, console logger for development
 	if environment == "production" {
@@ -32,7 +32,7 @@ func InitLogger() {
 	cfg.EncoderConfig.StacktraceKey = ""
 
 	// Set log level from configuration
-	levelStr := strings.ToLower(config.AppConfig.LogLevel)
+	levelStr := strings.ToLower(config.GetConfig().LogLevel)
 	switch levelStr {
 	case "debug":
 		cfg.Level = zap.NewAtomicLevelAt(zapcore.DebugLevel)
