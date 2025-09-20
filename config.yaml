@@ -1,0 +1,3 @@
+logging:
+  level: "debug"
+  stage: "dev" # dev | production
