@@ -3,19 +3,27 @@ package config
 import (
 	"fmt"
 	"log"
+
 	"os"
 	"sync"
 
+	"github.com/gagliardetto/solana-go/rpc"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
 	Logging Logging `yaml:"logging"`
+	Solana  Solana  `yaml:"solana"`
 }
 
 type Logging struct {
 	Level string `yaml:"level"`
 	Stage string `yaml:"stage"`
+}
+
+type Solana struct {
+	URL    string `yaml:"rpc-endpoint"`
+	Client *rpc.Client
 }
 
 var (
@@ -38,6 +46,10 @@ func Get() Config {
 	return appConfig
 }
 
+func (c Config) Client() *rpc.Client {
+	return c.Solana.Client
+}
+
 func initWithPath(configPath string) error {
 	b, err := os.ReadFile(configPath)
 	if err != nil {
@@ -48,5 +60,6 @@ func initWithPath(configPath string) error {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	appConfig.Solana.Client = rpc.New(appConfig.Solana.URL)
 	return nil
 }
