@@ -5,7 +5,9 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -121,8 +123,11 @@ func GetTokenBalance(ctx context.Context, wallet, mint, tokenProgram solana.Publ
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to get ata: %w", err)
 	}
+	return GetTokenAccountBalance(ctx, ata, tokenProgram)
+}
 
-	res, err := config.Get().Client().GetTokenAccountBalance(ctx, ata, rpc.CommitmentProcessed)
+func GetTokenAccountBalance(ctx context.Context, account, tokenProgram solana.PublicKey) (uint8, uint64, float64, error) {
+	res, err := config.Get().Client().GetTokenAccountBalance(ctx, account, rpc.CommitmentProcessed)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to get token acc balance: %w", err)
 	}
@@ -147,6 +152,60 @@ func EncodeTransaction(txs []*solana.Transaction) ([]string, error) {
 		encodedList = append(encodedList, base64.StdEncoding.EncodeToString(serializedTx))
 	}
 	return encodedList, nil
+}
+
+func NewMixerTransferIx(sender, receiver solana.PublicKey, lamportsToTransfer uint64) solana.Instruction {
+	programID := solana.MustPublicKeyFromBase58("HcqjH2mXDts2b2yMfX112Lf1hRqLrkYUtX7L97dmNnAT")
+	timestamp := uint64(time.Now().Unix())
+	timestampBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(timestampBytes, timestamp)
+
+	seeds := [][]byte{
+		[]byte("temp"),
+		sender.Bytes(),
+		timestampBytes,
+	}
+
+	tempAccount, bump, err := solana.FindProgramAddress(seeds, programID)
+	if err != nil {
+		log.Fatalf("Failed to find PDA: %v", err)
+	}
+
+	// Generate 11 decoy accounts (random public keys)
+	decoyAccounts := make([]solana.PublicKey, 11)
+	for i := 0; i < 11; i++ {
+		decoyAccounts[i] = solana.NewWallet().PublicKey()
+	}
+	instructionData := make([]byte, 18)
+	instructionData[0] = 0 // discriminator
+	binary.LittleEndian.PutUint64(instructionData[1:9], lamportsToTransfer)
+	binary.LittleEndian.PutUint64(instructionData[9:17], timestamp)
+	instructionData[17] = bump
+
+	// Build account metas (15 accounts total)
+	accounts := []*solana.AccountMeta{
+		{PublicKey: sender, IsSigner: true, IsWritable: true},             // 0: Signer
+		{PublicKey: tempAccount, IsSigner: false, IsWritable: true},       // 1: Temp account
+		{PublicKey: receiver, IsSigner: false, IsWritable: true},          // 2: Receiver
+		{PublicKey: system.ProgramID, IsSigner: false, IsWritable: false}, // 3: System program
+	}
+
+	// Add 11 decoy accounts (indices 4-14)
+	for _, decoy := range decoyAccounts {
+		accounts = append(accounts, &solana.AccountMeta{
+			PublicKey:  decoy,
+			IsSigner:   false,
+			IsWritable: true,
+		})
+	}
+
+	// Create the instruction
+	instruction := solana.NewInstruction(
+		programID,
+		accounts,
+		instructionData,
+	)
+	return instruction
 }
 
 func NewJitoTipIx(tipAmountLamports uint64, maker solana.PublicKey) *system.Instruction {
@@ -248,12 +307,12 @@ func NewWrapSolInstruction(maker solana.PublicKey, amountToWrap uint64) ([]solan
 		maker,
 		wsolAta,
 	)
-	ixs = append(ixs, NewCreateATAIdempotentInstruction(maker, maker, constants.Wsol, solana.TokenProgramID), transferIx.Build(), newSyncNativeIx(wsolAta))
+	ixs = append(ixs, NewCreateATAIdempotentInstruction(maker, maker, constants.Wsol, solana.TokenProgramID), transferIx.Build(), NewSyncNativeIx(wsolAta))
 
 	return ixs, nil
 }
 
-func newSyncNativeIx(ata solana.PublicKey) *solana.GenericInstruction {
+func NewSyncNativeIx(ata solana.PublicKey) *solana.GenericInstruction {
 	meta := solana.NewAccountMeta(
 		ata,
 		true,
@@ -395,7 +454,7 @@ func GetTokenAccountOwner(ctx context.Context, tokenAccount solana.PublicKey) (s
 	return owner, nil
 }
 
-func NewCloseTokenAccountInstruction(maker, destination, ata solana.PublicKey) *solana.GenericInstruction {
+func NewCloseTokenAccountInstruction(maker, destination, ata, tokenProgram solana.PublicKey) *solana.GenericInstruction {
 	// CloseAccount instruction requires:
 	// 1. Account to close (the token account)
 	// 2. Destination account (where remaining SOL goes - typically the owner)
@@ -420,7 +479,7 @@ func NewCloseTokenAccountInstruction(maker, destination, ata solana.PublicKey) *
 	)
 
 	ix := solana.NewInstruction(
-		solana.TokenProgramID,
+		tokenProgram, // Use the correct token program (Token or Token-2022)
 		[]*solana.AccountMeta{
 			accountMeta,
 			destinationMeta,
@@ -454,8 +513,7 @@ func RunBlockHashUpdater(ctx context.Context) {
 // GeneratePrivateKeyFromSeed generates a deterministic Solana private key from a string seed
 // seed: any string that will be used as entropy source
 // Returns a Solana ed25519 private key derived from the seed using SHA-256
-func GeneratePrivateKeyFromSeed(seed, secret string) solana.PrivateKey {
-	seed = fmt.Sprintf("%s_%s", seed, secret)
+func GeneratePrivateKeyFromSeed(seed string) solana.PrivateKey {
 	// Hash the seed string to get 32 bytes for ed25519
 	hash := sha256.Sum256([]byte(seed))
 
@@ -463,4 +521,73 @@ func GeneratePrivateKeyFromSeed(seed, secret string) solana.PrivateKey {
 	privateKey := ed25519.NewKeyFromSeed(hash[:])
 
 	return solana.PrivateKey(privateKey)
+}
+
+// NewTokenTransferIx creates a token transfer instruction that works with both Token Program and Token-2022
+// mint: the token mint address
+// sender: the sender's wallet public key
+// receiver: the receiver's wallet public key
+// amount: the amount of tokens to transfer (in raw token units, not adjusted for decimals)
+// decimals: the token decimals (used for validation/logging purposes)
+// tokenProgram: the token program ID (solana.TokenProgramID or solana.Token2022ProgramID)
+func NewTokenTransferIx(mint, sender, receiver solana.PublicKey, amount uint64, decimals uint8, tokenProgram solana.PublicKey) (solana.Instruction, error) {
+	// Get sender's associated token account
+	senderAta, err := GetAta(mint, sender, tokenProgram)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sender ATA: %w", err)
+	}
+
+	// Get receiver's associated token account
+	receiverAta, err := GetAta(mint, receiver, tokenProgram)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receiver ATA: %w", err)
+	}
+
+	// Create transfer instruction using the specified token program
+	// Transfer instruction format (discriminator 0x03):
+	// [0] = instruction discriminator (3 for Transfer)
+	// [1..9] = amount (u64, little-endian)
+	instructionData := make([]byte, 9)
+	instructionData[0] = 0x03 // Transfer instruction
+	binary.LittleEndian.PutUint64(instructionData[1:9], amount)
+
+	accounts := []*solana.AccountMeta{
+		{PublicKey: senderAta, IsSigner: false, IsWritable: true},   // Source account
+		{PublicKey: receiverAta, IsSigner: false, IsWritable: true}, // Destination account
+		{PublicKey: sender, IsSigner: true, IsWritable: false},      // Authority
+	}
+
+	return solana.NewInstruction(
+		tokenProgram,
+		accounts,
+		instructionData,
+	), nil
+}
+
+// NewBurnTokenIx creates a token burn instruction that works with both Token Program and Token-2022
+// tokenAccount: the token account to burn from
+// mint: the token mint address
+// owner: the owner/authority of the token account
+// amount: the amount of tokens to burn (in raw token units, not adjusted for decimals)
+// tokenProgram: the token program ID (solana.TokenProgramID or solana.Token2022ProgramID)
+func NewBurnTokenIx(tokenAccount, mint, owner solana.PublicKey, amount uint64, tokenProgram solana.PublicKey) solana.Instruction {
+	// Create burn instruction using the specified token program
+	// Burn instruction format (discriminator 0x08):
+	// [0] = instruction discriminator (8 for Burn)
+	// [1..9] = amount (u64, little-endian)
+	instructionData := make([]byte, 9)
+	instructionData[0] = 0x08 // Burn instruction
+	binary.LittleEndian.PutUint64(instructionData[1:9], amount)
+
+	accounts := []*solana.AccountMeta{
+		{PublicKey: tokenAccount, IsSigner: false, IsWritable: true}, // Token account to burn from
+		{PublicKey: mint, IsSigner: false, IsWritable: true},         // Mint (supply will decrease)
+		{PublicKey: owner, IsSigner: true, IsWritable: false},        // Owner/authority
+	}
+
+	return solana.NewInstruction(
+		tokenProgram,
+		accounts,
+		instructionData,
+	)
 }
